@@ -1,0 +1,122 @@
+# Author: Christos Iliadis
+# host: Newcastle University
+
+import sys
+from pathlib import Path
+import geopandas as gpd
+from shapely.geometry import LineString, Point
+from shapely.ops import unary_union
+import numpy as np
+
+# ---------- CONFIG (override via CLI/argparse in production) ----------
+STUDY_AREA_PATH = "study_area.geojson"     # polygon
+ROADS_PATH      = None                     # if None, download via OSMnx using study area bbox
+BUILDINGS_PATH  = "buildings.geojson"      # optional (can be None)
+TARGET_CRS      = "EPSG:27700"             # pick a local projected CRS (example: British National Grid)
+SPACING_M       = 50.0
+PRIMARY_BUFFER  = 20.0
+SECONDARY_BUFFER= 10.0
+ROAD_CLASSES    = {"primary": PRIMARY_BUFFER, "secondary": SECONDARY_BUFFER}
+OUTPUT_DIR      = Path("outputs")
+# ---------------------------------------------------------------------
+
+def load_or_download_roads(study_area_gdf):
+    if ROADS_PATH:
+        roads = gpd.read_file(ROADS_PATH)
+        return roads
+    # OSM download with osmnx (optional dependency)
+    try:
+        import osmnx as ox
+        bbox = study_area_gdf.total_bounds  # [minx, miny, maxx, maxy] in study CRS
+        # Ensure ox works in WGS84
+        study_area_wgs = study_area_gdf.to_crs(4326)
+        bbox = study_area_wgs.total_bounds
+        G = ox.graph_from_bbox(north=bbox[3], south=bbox[1], east=bbox[2], west=bbox[0], network_type="drive")
+        edges = ox.graph_to_gdfs(G, nodes=False, edges=True)
+        roads = edges[['geometry','highway']].copy()
+        roads = roads.explode(index_parts=False, ignore_index=True)
+        return roads
+    except ImportError:
+        raise RuntimeError("osmnx not installed and ROADS_PATH not provided.")
+
+def buffer_by_class(roads_gdf, class_to_buffer, target_crs):
+    roads = roads_gdf.copy()
+    if roads.crs is None:
+        roads.set_crs(4326, inplace=True)  # assume WGS84 if unknown
+    roads = roads.to_crs(target_crs)
+    out = []
+    for klass, buf in class_to_buffer.items():
+        sel = roads[roads['highway'].astype(str).str.contains(klass, case=False, na=False)]
+        if len(sel) == 0:
+            continue
+        out.append(sel.buffer(buf, cap_style=2))  # square caps often better along roads
+    if not out:
+        return gpd.GeoDataFrame(geometry=[], crs=target_crs)
+    merged = gpd.GeoSeries(out[0], crs=target_crs)
+    for s in out[1:]:
+        merged = merged.union(s)
+    dissolved = gpd.GeoSeries(unary_union(merged), crs=target_crs)
+    return gpd.GeoDataFrame(geometry=dissolved.explode(index_parts=False).buffer(0), crs=target_crs)
+
+def polygon_to_line(poly_gdf):
+    # shapely handles polygon boundaries as LineString(s)
+    line_geoms = []
+    for geom in poly_gdf.geometry:
+        if geom is None:
+            continue
+        for ring in [geom.exterior, *(geom.interiors or [])]:
+            line_geoms.append(LineString(ring.coords))
+    return gpd.GeoDataFrame(geometry=line_geoms, crs=poly_gdf.crs)
+
+def points_along_lines(lines_gdf, spacing):
+    pts = []
+    for geom in lines_gdf.geometry:
+        if geom is None or geom.is_empty:
+            continue
+        length = geom.length
+        if length <= 0:
+            continue
+        dists = np.arange(spacing/2.0, length, spacing)  # center the first inlet a half-spacing in
+        for d in dists:
+            pts.append(geom.interpolate(d))
+    return gpd.GeoDataFrame(geometry=pts, crs=lines_gdf.crs)
+
+def main():
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    study = gpd.read_file(STUDY_AREA_PATH)
+    if study.crs is None:
+        raise ValueError("Study area CRS is undefined; please set a projected CRS.")
+
+    # Roads
+    roads = load_or_download_roads(study)
+    # Clip to study area (after bringing to same CRS)
+    roads = roads.set_crs(roads.crs or 4326).to_crs(study.crs)
+    roads = gpd.overlay(roads, study, how="intersection")
+
+    # Buffers -> dissolve polygon
+    road_poly = buffer_by_class(roads, ROAD_CLASSES, TARGET_CRS)
+    road_poly.to_file(OUTPUT_DIR / "roads_buffered_dissolved.gpkg", layer="buffered", driver="GPKG")
+
+    # Polygon to line backbone
+    lines = polygon_to_line(road_poly)
+    lines.to_file(OUTPUT_DIR / "roads_backbone.gpkg", layer="lines", driver="GPKG")
+
+    # Points along lines (SSD candidates)
+    ssds = points_along_lines(lines, SPACING_M)
+    ssds.to_file(OUTPUT_DIR / "ssd_candidates.gpkg", layer="ssds_raw", driver="GPKG")
+
+    # Remove points inside buildings
+    if BUILDINGS_PATH and Path(BUILDINGS_PATH).exists():
+        bld = gpd.read_file(BUILDINGS_PATH).to_crs(ssds.crs)
+        inside = gpd.sjoin(ssds, bld, predicate="within", how="left")
+        keep = inside[inside.index_right.isna()].drop(columns=["index_right"])
+        keep.to_file(OUTPUT_DIR / "ssds_final.gpkg", layer="ssds", driver="GPKG")
+    else:
+        ssds.rename(columns={}, inplace=True)
+        ssds.to_file(OUTPUT_DIR / "ssds_final.gpkg", layer="ssds", driver="GPKG")
+
+    print("Done. Outputs in", OUTPUT_DIR.resolve())
+
+if __name__ == "__main__":
+    sys.exit(main())
