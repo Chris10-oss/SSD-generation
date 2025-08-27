@@ -2,18 +2,15 @@
 # Host: Newcastle University
 
 """
-Global SSD generator (Synthetic Storm Drains) — kerb-side + staggered + min-distance
+Global SSD generator (Synthetic Storm Drains) — kerb-side + staggered + min-distance + CityCAT export
 
-- Configure paths/CRS in the CONFIG block (no CLI needed).
-- Downloads roads with OSMnx inside your study polygon (or set ROADS_PATH to use your own).
-- Projected CRS in metres:
-    • TARGET_CRS = None  -> auto-pick local UTM
-    • TARGET_CRS = "EPSG:2100"/"EPSG:27700"/... -> force that CRS
-- Kerb-side placement on both sides using per-class kerb offsets.
-- Staggered pattern: alternate sides so consecutive inlets are ~SPACING apart.
-- Enforce global minimum separation between any two SSDs (e.g., 50 m).
-- Optional building exclusion; optional QA layers.
-- Outputs ESRI Shapefiles in OUTPUT_DIR.
+- Configure paths/CRS + CityCAT header in CONFIG (no CLI needed).
+- Downloads roads with OSMnx (or uses your own roads).
+- Places SSDs on both kerb lines, staggered, then enforces a global min spacing.
+- Excludes SSDs inside buildings (optional).
+- Exports:
+    * Shapefiles: ssd_candidates.shp, ssds_final.shp (+ optional QA layers)
+    * CityCAT text file: Inlets.txt (first row = header numbers, then id x y 1)
 """
 
 import sys
@@ -42,7 +39,7 @@ except Exception:
 STUDY_AREA_PATH = r"copy the shape file of the study area"
 
 # OPTIONAL: buildings polygons (for excluding SSDs within footprints)
-BUILDINGS_PATH  = r"copy the shapw file of the buildings"
+BUILDINGS_PATH  = r"copy the shape file of the buildings"
 # BUILDINGS_PATH = None
 
 # OPTIONAL: use your own roads instead of OSM download
@@ -50,10 +47,10 @@ ROADS_PATH = None
 # ROADS_PATH = r"D:\data\roads.gpkg"
 
 # OUTPUT folder
-OUTPUT_DIR = Path(r"copy the folder for the outputs")
+OUTPUT_DIR = Path(r"copy the folder path for your outputs")
 
 # CRS in metres: set to None for auto-UTM, or provide "EPSG:2100" / "EPSG:27700", etc.
-TARGET_CRS = "add here your EPSC coordinate system of your study area"   # or None
+TARGET_CRS = "add the projected coordinate system (e.g. EPSG:27700)"   # or None
 
 # Export QA layers (buffered polygons + backbone lines)?
 EXPORT_BACKBONE = True
@@ -92,6 +89,14 @@ BUFFERS_M = {
     # Optionally include locals:
     # "residential": 8, "unclassified": 8, "service": 6, "living_street": 6,
 }
+
+# --- CityCAT export configuration ---
+# First row numbers (e.g., inlet size(s) and friction coefficient) – adjust as needed
+CITYCAT_HEADER = (0.30, 0.30, 0.50)   # example matches your format
+CITYCAT_FILENAME = "Inlets.txt"
+CITYCAT_COORD_DECIMALS = 4            # number of decimals for x/y in txt
+CITYCAT_HEADER_DECIMALS = 2           # decimals for first-row numbers
+CITYCAT_ACTIVE_FLAG = 1               # last column value
 # =========================================================
 
 
@@ -329,6 +334,38 @@ def enforce_min_distance(points_gdf: gpd.GeoDataFrame, min_dist: float) -> gpd.G
         out.reset_index(drop=True, inplace=True)
         return out
 
+# --- CityCAT export ---
+
+def write_citycat_inlets(points_gdf: gpd.GeoDataFrame,
+                         out_path: Path,
+                         header_triplet=(0.30, 0.30, 0.50),
+                         coord_decimals: int = 4,
+                         header_decimals: int = 2,
+                         active_flag: int = 1,
+                         id_start: int = 0) -> None:
+    """
+    Write CityCAT inlet file:
+      - First row: three numbers (e.g., inlet size(s), friction coeff)
+      - Next rows: id  x  y  active_flag
+    """
+    if points_gdf.empty:
+        raise ValueError("No points to write to CityCAT file.")
+
+    # Deterministic ordering (x then y)
+    pts = points_gdf.copy()
+    pts["_x"] = pts.geometry.x
+    pts["_y"] = pts.geometry.y
+    pts = pts.sort_values(by=["_x", "_y"]).reset_index(drop=True)
+
+    fmt_h = f"{{:.{header_decimals}f}} {{:.{header_decimals}f}} {{:.{header_decimals}f}}\n"
+    fmt_p = f"{{:d}} {{:.{coord_decimals}f}} {{:.{coord_decimals}f}} {{:d}}\n"
+
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write(fmt_h.format(*header_triplet))
+        for i, row in pts.iterrows():
+            idx = id_start + i
+            f.write(fmt_p.format(idx, float(row["_x"]), float(row["_y"]), active_flag))
+
 # --- Building exclusion ---
 
 def exclude_points_in_buildings(points: gpd.GeoDataFrame, buildings_path: str | None, target_crs: str) -> gpd.GeoDataFrame:
@@ -406,7 +443,20 @@ def main():
 
     ssds_final.to_file(OUTPUT_DIR / "ssds_final.shp", driver="ESRI Shapefile")
 
-    # 5) Optional QA exports (buffered polygons + backbone lines)
+    # 5) CityCAT text export
+    citycat_path = OUTPUT_DIR / CITYCAT_FILENAME
+    write_citycat_inlets(
+        ssds_final,
+        citycat_path,
+        header_triplet=CITYCAT_HEADER,
+        coord_decimals=CITYCAT_COORD_DECIMALS,
+        header_decimals=CITYCAT_HEADER_DECIMALS,
+        active_flag=CITYCAT_ACTIVE_FLAG,
+        id_start=0
+    )
+    print(f"[info] CityCAT inlet file written: {citycat_path}")
+
+    # 6) Optional QA exports (buffered polygons + backbone lines)
     if EXPORT_BACKBONE:
         # buffered polygons for QA
         ensure_projected(roads, "Roads")
@@ -435,13 +485,15 @@ def main():
                     gpd.GeoDataFrame(geometry=lines, crs=road_poly.crs)\
                       .to_file(OUTPUT_DIR / "roads_backbone.shp", driver="ESRI Shapefile")
 
-    # 6) Save run config
+    # 7) Save run config
     (OUTPUT_DIR / "ssd_config.json").write_text(json.dumps({
         "target_crs": target_crs,
         "spacing_map": SPACING_MAP,
         "kerb_offset_map": KERB_OFFSET_MAP,
         "min_ssd_spacing": MIN_SSD_SPACING,
         "buffers_m_QA": BUFFERS_M,
+        "citycat_header": CITYCAT_HEADER,
+        "citycat_filename": CITYCAT_FILENAME,
         "study_area_path": str(STUDY_AREA_PATH),
         "buildings_path": str(BUILDINGS_PATH) if BUILDINGS_PATH else None,
         "roads_path": str(ROADS_PATH) if ROADS_PATH else None
@@ -450,6 +502,7 @@ def main():
     print("\n[done] Outputs:", OUTPUT_DIR.resolve())
     print(" - ssd_candidates.shp  (staggered kerb-side, min-distance enforced)")
     print(" - ssds_final.shp      (after building exclusion + min-distance)")
+    print(f" - {CITYCAT_FILENAME}   (CityCAT inlet file)")
     if EXPORT_BACKBONE:
         print(" - roads_buffered_dissolved.shp (QA)")
         print(" - roads_backbone.shp          (QA)")
