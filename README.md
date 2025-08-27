@@ -1,4 +1,4 @@
-# SSD-generation
+# SSDGen Pro
 1) Study area selection → STUDY_AREA_PATH (or polygon layer in QGIS).
 
 2) Buffers by road class → buffer_by_class with {primary:20, secondary:10}.
