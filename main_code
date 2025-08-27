@@ -1,122 +1,458 @@
-# Author: Christos Iliadis
-# host: Newcastle University
+# Author: Chris Iliadis
+# Host: Newcastle University
+
+"""
+Global SSD generator (Synthetic Storm Drains) — kerb-side + staggered + min-distance
+
+- Configure paths/CRS in the CONFIG block (no CLI needed).
+- Downloads roads with OSMnx inside your study polygon (or set ROADS_PATH to use your own).
+- Projected CRS in metres:
+    • TARGET_CRS = None  -> auto-pick local UTM
+    • TARGET_CRS = "EPSG:2100"/"EPSG:27700"/... -> force that CRS
+- Kerb-side placement on both sides using per-class kerb offsets.
+- Staggered pattern: alternate sides so consecutive inlets are ~SPACING apart.
+- Enforce global minimum separation between any two SSDs (e.g., 50 m).
+- Optional building exclusion; optional QA layers.
+- Outputs ESRI Shapefiles in OUTPUT_DIR.
+"""
 
 import sys
 from pathlib import Path
+import json
+import warnings
+
 import geopandas as gpd
-from shapely.geometry import LineString, Point
-from shapely.ops import unary_union
+from shapely.geometry import LineString, MultiLineString
+from shapely.ops import linemerge
 import numpy as np
+import pandas as pd
 
-# ---------- CONFIG (override via CLI/argparse in production) ----------
-STUDY_AREA_PATH = "study_area.geojson"     # polygon
-ROADS_PATH      = None                     # if None, download via OSMnx using study area bbox
-BUILDINGS_PATH  = "buildings.geojson"      # optional (can be None)
-TARGET_CRS      = "EPSG:27700"             # pick a local projected CRS (example: British National Grid)
-SPACING_M       = 50.0
-PRIMARY_BUFFER  = 20.0
-SECONDARY_BUFFER= 10.0
-ROAD_CLASSES    = {"primary": PRIMARY_BUFFER, "secondary": SECONDARY_BUFFER}
-OUTPUT_DIR      = Path("outputs")
-# ---------------------------------------------------------------------
+# ---------- Version-safe union helper (Shapely 1.8/2.x) ----------
+try:
+    from shapely import union_all as _union_all  # Shapely >= 2
+    def union_all_geoms(geoms):
+        return _union_all(list(geoms))
+except Exception:
+    from shapely.ops import unary_union as _unary_union  # Shapely < 2
+    def union_all_geoms(geoms):
+        return _unary_union(list(geoms))
 
-def load_or_download_roads(study_area_gdf):
-    if ROADS_PATH:
-        roads = gpd.read_file(ROADS_PATH)
-        return roads
-    # OSM download with osmnx (optional dependency)
+# ========================= CONFIG =========================
+# REQUIRED: study polygon
+STUDY_AREA_PATH = r"copy the shape file of the study area"
+
+# OPTIONAL: buildings polygons (for excluding SSDs within footprints)
+BUILDINGS_PATH  = r"copy the shapw file of the buildings"
+# BUILDINGS_PATH = None
+
+# OPTIONAL: use your own roads instead of OSM download
+ROADS_PATH = None
+# ROADS_PATH = r"D:\data\roads.gpkg"
+
+# OUTPUT folder
+OUTPUT_DIR = Path(r"copy the folder for the outputs")
+
+# CRS in metres: set to None for auto-UTM, or provide "EPSG:2100" / "EPSG:27700", etc.
+TARGET_CRS = "add here your EPSC coordinate system of your study area"   # or None
+
+# Export QA layers (buffered polygons + backbone lines)?
+EXPORT_BACKBONE = True
+
+# --- Placement parameters (metres) ---
+# Per-class SSD spacing (this is the "global spacing" between consecutive inlets along the road).
+SPACING_MAP = {
+    "motorway": 60, "motorway_link": 60,
+    "trunk": 60, "trunk_link": 60,
+    "primary": 50, "primary_link": 50,
+    "secondary": 50, "secondary_link": 50,
+    "tertiary": 50, "tertiary_link": 50,
+    "_default": 50
+}
+
+# Per-class kerb offsets from centerline to each side
+KERB_OFFSET_MAP = {
+    "motorway": 5.0, "motorway_link": 5.0,
+    "trunk": 4.0, "trunk_link": 4.0,
+    "primary": 3.5, "primary_link": 3.5,
+    "secondary": 3.0, "secondary_link": 3.0,
+    "tertiary": 3.0, "tertiary_link": 3.0,
+    "_default": 3.0
+}
+
+# Global minimum distance between ANY two SSD points (metres)
+MIN_SSD_SPACING = 50.0
+
+# Road class → buffer (for QA polygons)
+BUFFERS_M = {
+    "motorway": 25, "motorway_link": 25,
+    "trunk": 20, "trunk_link": 20,
+    "primary": 20, "primary_link": 20,
+    "secondary": 10, "secondary_link": 10,
+    "tertiary": 10, "tertiary_link": 10,
+    # Optionally include locals:
+    # "residential": 8, "unclassified": 8, "service": 6, "living_street": 6,
+}
+# =========================================================
+
+
+def ensure_projected(gdf: gpd.GeoDataFrame, name: str):
+    if gdf.crs is None:
+        raise ValueError(f"{name} CRS is undefined.")
+    if not gdf.crs.is_projected:
+        raise ValueError(f"{name} CRS is geographic (degrees). Reproject to a projected CRS in metres.")
+
+def auto_target_crs(study_gdf: gpd.GeoDataFrame) -> str:
+    """Pick a local UTM based on centroid (pyproj>=3 suggested)."""
+    try:
+        from pyproj import CRS
+        centroid = study_gdf.to_crs(4326).unary_union.centroid
+        crs = CRS.estimate_utm_crs(latlon=(centroid.y, centroid.x))
+        return crs.to_authority()[-1]  # 'EPSG:XXXX'
+    except Exception:
+        warnings.warn("Auto UTM failed; falling back to EPSG:3857 (metres, but distorted).")
+        return "EPSG:3857"
+
+def download_roads_osm(study_gdf_4326: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+    """Download OSM roads inside the study polygon (expects 4326)."""
     try:
         import osmnx as ox
-        bbox = study_area_gdf.total_bounds  # [minx, miny, maxx, maxy] in study CRS
-        # Ensure ox works in WGS84
-        study_area_wgs = study_area_gdf.to_crs(4326)
-        bbox = study_area_wgs.total_bounds
-        G = ox.graph_from_bbox(north=bbox[3], south=bbox[1], east=bbox[2], west=bbox[0], network_type="drive")
-        edges = ox.graph_to_gdfs(G, nodes=False, edges=True)
-        roads = edges[['geometry','highway']].copy()
-        roads = roads.explode(index_parts=False, ignore_index=True)
-        return roads
     except ImportError:
-        raise RuntimeError("osmnx not installed and ROADS_PATH not provided.")
+        raise RuntimeError("osmnx not installed. Install with: pip install osmnx")
 
-def buffer_by_class(roads_gdf, class_to_buffer, target_crs):
-    roads = roads_gdf.copy()
-    if roads.crs is None:
-        roads.set_crs(4326, inplace=True)  # assume WGS84 if unknown
-    roads = roads.to_crs(target_crs)
-    out = []
-    for klass, buf in class_to_buffer.items():
-        sel = roads[roads['highway'].astype(str).str.contains(klass, case=False, na=False)]
-        if len(sel) == 0:
-            continue
-        out.append(sel.buffer(buf, cap_style=2))  # square caps often better along roads
-    if not out:
-        return gpd.GeoDataFrame(geometry=[], crs=target_crs)
-    merged = gpd.GeoSeries(out[0], crs=target_crs)
-    for s in out[1:]:
-        merged = merged.union(s)
-    dissolved = gpd.GeoSeries(unary_union(merged), crs=target_crs)
-    return gpd.GeoDataFrame(geometry=dissolved.explode(index_parts=False).buffer(0), crs=target_crs)
+    polygon = union_all_geoms(study_gdf_4326.geometry.values)
+    G = ox.graph_from_polygon(polygon, network_type="drive")
+    edges = ox.graph_to_gdfs(G, nodes=False, edges=True)
+    roads = edges[["geometry", "highway"]].copy()
+    # Clip to be safe
+    roads = gpd.overlay(roads, study_gdf_4326, how="intersection")
+    return roads  # still 4326
 
-def polygon_to_line(poly_gdf):
-    # shapely handles polygon boundaries as LineString(s)
-    line_geoms = []
-    for geom in poly_gdf.geometry:
-        if geom is None:
-            continue
-        for ring in [geom.exterior, *(geom.interiors or [])]:
-            line_geoms.append(LineString(ring.coords))
-    return gpd.GeoDataFrame(geometry=line_geoms, crs=poly_gdf.crs)
+def normalize_highway(roads: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+    roads = roads.copy()
+    if "highway" in roads.columns:
+        roads["__hw__"] = roads["highway"].apply(
+            lambda v: ",".join(v).lower() if isinstance(v, (list, tuple, set)) else str(v).lower()
+        )
+    else:
+        roads["__hw__"] = ""
+    return roads
 
-def points_along_lines(lines_gdf, spacing):
-    pts = []
-    for geom in lines_gdf.geometry:
-        if geom is None or geom.is_empty:
+def buffer_roads(roads_proj: gpd.GeoDataFrame, buffers_map: dict) -> gpd.GeoDataFrame:
+    """Buffered roads merged to a single polygon layer (QA)."""
+    ensure_projected(roads_proj, "Roads")
+    roads = normalize_highway(roads_proj)
+
+    parts = []
+    for klass, buf in buffers_map.items():
+        sel = roads[roads["__hw__"].str.contains(klass, na=False)]
+        cnt = len(sel)
+        print(f"[buffer] class='{klass}' matched {cnt} features; buf={buf} m")
+        if cnt > 0:
+            parts.append(sel.buffer(buf, cap_style=2, join_style=2))
+
+    if not parts:
+        return gpd.GeoDataFrame(geometry=[], crs=roads.crs)
+
+    merged = pd.concat(parts, ignore_index=True)
+    dissolved = union_all_geoms(merged.geometry.values)
+    if dissolved is None or dissolved.is_empty:
+        return gpd.GeoDataFrame(geometry=[], crs=roads.crs)
+
+    gser = gpd.GeoSeries(dissolved, crs=roads.crs).explode(index_parts=False).buffer(0)
+    return gpd.GeoDataFrame(geometry=gser, crs=roads.crs)
+
+# --- Kerb-side helpers ---
+
+def _iter_lines(geom):
+    """Yield LineStrings from LineString or MultiLineString."""
+    if geom is None or geom.is_empty:
+        return
+    if isinstance(geom, LineString):
+        yield geom
+    elif isinstance(geom, MultiLineString):
+        for g in geom.geoms:
+            if isinstance(g, LineString):
+                yield g
+    else:
+        try:
+            m = linemerge(geom)
+            yield from _iter_lines(m)
+        except Exception:
+            return
+
+def _offset_lines(line: LineString, offset: float, side: str):
+    """Create a parallel offset line; returns list (offset may produce MultiLineString)."""
+    try:
+        off = line.parallel_offset(distance=offset, side=side, join_style=2, mitre_limit=5.0)
+        if off is None or off.is_empty:
+            return []
+        if isinstance(off, LineString):
+            return [off]
+        elif isinstance(off, MultiLineString):
+            return [g for g in off.geoms if isinstance(g, LineString)]
+        else:
+            return []
+    except Exception:
+        return []
+
+def points_on_kerb_sides_staggered(roads_proj: gpd.GeoDataFrame, spacing_map: dict, kerb_map: dict) -> gpd.GeoDataFrame:
+    """
+    Place SSD points on BOTH kerb sides with a staggered pattern:
+    even indices on left, odd on right. Step along the road by spacing/2 so
+    consecutive SSDs (alternating sides) are ~spacing apart globally.
+    """
+    ensure_projected(roads_proj, "Roads")
+    roads = normalize_highway(roads_proj)
+
+    pts, attrs = [], []
+    covered = pd.Index([])
+
+    # Explicit classes
+    for klass, spacing in spacing_map.items():
+        if klass.startswith("_"):
             continue
-        length = geom.length
-        if length <= 0:
+        kerb = float(kerb_map.get(klass, kerb_map.get("_default", 3.0)))
+        sel = roads[roads["__hw__"].str.contains(klass, na=False)]
+        if sel.empty:
             continue
-        dists = np.arange(spacing/2.0, length, spacing)  # center the first inlet a half-spacing in
-        for d in dists:
-            pts.append(geom.interpolate(d))
-    return gpd.GeoDataFrame(geometry=pts, crs=lines_gdf.crs)
+        covered = covered.union(sel.index)
+
+        for geom in sel.geometry:
+            for line in _iter_lines(geom):
+                left_lines  = _offset_lines(line, kerb, "left")
+                right_lines = _offset_lines(line, kerb, "right")
+                if not left_lines or not right_lines:
+                    continue
+                left, right = left_lines[0], right_lines[0]
+                L = min(left.length, right.length)
+                if L <= 0:
+                    continue
+
+                # stagger: positions every spacing/2; alternate sides
+                step = spacing / 2.0
+                dists = np.arange(step, L, step)
+                for i, d in enumerate(dists):
+                    side = "left" if i % 2 == 0 else "right"
+                    line_use = left if side == "left" else right
+                    if d < line_use.length:
+                        pts.append(line_use.interpolate(d))
+                        attrs.append({"class": klass, "side": side, "spacing_m": spacing, "kerb_m": kerb})
+
+    # Remaining segments (default spacing/kerb)
+    default_spacing = float(spacing_map.get("_default", 50))
+    default_kerb    = float(kerb_map.get("_default", 3.0))
+    rest = roads[~roads.index.isin(covered)]
+    for geom in rest.geometry:
+        for line in _iter_lines(geom):
+            left_lines  = _offset_lines(line, default_kerb, "left")
+            right_lines = _offset_lines(line, default_kerb, "right")
+            if not left_lines or not right_lines:
+                continue
+            left, right = left_lines[0], right_lines[0]
+            L = min(left.length, right.length)
+            if L <= 0:
+                continue
+
+            step = default_spacing / 2.0
+            dists = np.arange(step, L, step)
+            for i, d in enumerate(dists):
+                side = "left" if i % 2 == 0 else "right"
+                line_use = left if side == "left" else right
+                if d < line_use.length:
+                    pts.append(line_use.interpolate(d))
+                    attrs.append({"class": "other", "side": side, "spacing_m": default_spacing, "kerb_m": default_kerb})
+
+    if not pts:
+        return gpd.GeoDataFrame(columns=["class", "side", "spacing_m", "kerb_m", "geometry"], crs=roads.crs)
+
+    return gpd.GeoDataFrame(attrs, geometry=pts, crs=roads.crs)
+
+# --- Global min-distance thinning ---
+
+def enforce_min_distance(points_gdf: gpd.GeoDataFrame, min_dist: float) -> gpd.GeoDataFrame:
+    """
+    Greedy thinning to enforce a global minimum spacing between SSD points.
+    Sorts by (x, y) for determinism; uses STRtree when available.
+    """
+    if points_gdf.empty:
+        return points_gdf
+
+    pts = points_gdf.copy().reset_index(drop=True)
+    pts["_x"] = pts.geometry.x
+    pts["_y"] = pts.geometry.y
+    pts = pts.sort_values(by=["_x", "_y"]).reset_index(drop=True)
+
+    try:
+        # Shapely STRtree fast path
+        from shapely.strtree import STRtree
+        geoms = list(pts.geometry.values)
+        tree = STRtree(geoms)
+        id_to_idx = {id(g): i for i, g in enumerate(geoms)}
+
+        kept_mask = np.zeros(len(pts), dtype=bool)
+        kept_indices = []
+
+        for i, g in enumerate(geoms):
+            if kept_mask[i]:
+                continue
+            # Check against already-kept neighbors within min_dist bbox
+            neighbors = tree.query(g.buffer(min_dist))
+            too_close = False
+            for h in neighbors:
+                j = id_to_idx.get(id(h), None)
+                if j is not None and kept_mask[j]:
+                    if g.distance(h) < min_dist:
+                        too_close = True
+                        break
+            if not too_close:
+                kept_mask[i] = True
+                kept_indices.append(i)
+
+        out = pts.iloc[kept_indices].drop(columns=["_x", "_y"])
+        out.reset_index(drop=True, inplace=True)
+        return out
+
+    except Exception:
+        # Fallback O(n^2)
+        kept_idx = []
+        kept_pts = []
+        for i, g in enumerate(pts.geometry):
+            ok = True
+            for h in kept_pts:
+                if g.distance(h) < min_dist:
+                    ok = False
+                    break
+            if ok:
+                kept_idx.append(i)
+                kept_pts.append(g)
+        out = pts.iloc[kept_idx].drop(columns=["_x", "_y"])
+        out.reset_index(drop=True, inplace=True)
+        return out
+
+# --- Building exclusion ---
+
+def exclude_points_in_buildings(points: gpd.GeoDataFrame, buildings_path: str | None, target_crs: str) -> gpd.GeoDataFrame:
+    """Remove points inside building footprints (sjoin with fallback)."""
+    if not buildings_path or not Path(buildings_path).exists():
+        return points
+    bld = gpd.read_file(buildings_path)
+    if bld.crs is None:
+        raise ValueError("Buildings CRS is undefined.")
+    bld = bld.to_crs(target_crs)
+    try:
+        inside = gpd.sjoin(points, bld, predicate="within", how="left")
+        keep = inside[inside.index_right.isna()].drop(columns=["index_right"])
+        return gpd.GeoDataFrame(keep, geometry="geometry", crs=points.crs)
+    except Exception:
+        # Fallback: tiny buffer + overlay if spatial index unavailable
+        eps = 0.01
+        pts_eps = points.copy()
+        pts_eps["geometry"] = pts_eps.buffer(eps)
+        dropped = gpd.overlay(pts_eps, bld, how="intersection")
+        ids_to_drop = set(dropped.index)
+        keep = points[~points.index.isin(ids_to_drop)]
+        return gpd.GeoDataFrame(keep, geometry="geometry", crs=points.crs)
+
+# --- Main pipeline ---
 
 def main():
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
+    # 1) Study area
     study = gpd.read_file(STUDY_AREA_PATH)
     if study.crs is None:
-        raise ValueError("Study area CRS is undefined; please set a projected CRS.")
+        raise ValueError("Study area CRS is undefined.")
+    target_crs = TARGET_CRS or auto_target_crs(study)
+    study = study.to_crs(target_crs)
+    ensure_projected(study, "Study area")
+    print(f"[info] Target CRS: {target_crs}")
 
-    # Roads
-    roads = load_or_download_roads(study)
-    # Clip to study area (after bringing to same CRS)
-    roads = roads.set_crs(roads.crs or 4326).to_crs(study.crs)
-    roads = gpd.overlay(roads, study, how="intersection")
-
-    # Buffers -> dissolve polygon
-    road_poly = buffer_by_class(roads, ROAD_CLASSES, TARGET_CRS)
-    road_poly.to_file(OUTPUT_DIR / "roads_buffered_dissolved.gpkg", layer="buffered", driver="GPKG")
-
-    # Polygon to line backbone
-    lines = polygon_to_line(road_poly)
-    lines.to_file(OUTPUT_DIR / "roads_backbone.gpkg", layer="lines", driver="GPKG")
-
-    # Points along lines (SSD candidates)
-    ssds = points_along_lines(lines, SPACING_M)
-    ssds.to_file(OUTPUT_DIR / "ssd_candidates.gpkg", layer="ssds_raw", driver="GPKG")
-
-    # Remove points inside buildings
-    if BUILDINGS_PATH and Path(BUILDINGS_PATH).exists():
-        bld = gpd.read_file(BUILDINGS_PATH).to_crs(ssds.crs)
-        inside = gpd.sjoin(ssds, bld, predicate="within", how="left")
-        keep = inside[inside.index_right.isna()].drop(columns=["index_right"])
-        keep.to_file(OUTPUT_DIR / "ssds_final.gpkg", layer="ssds", driver="GPKG")
+    # 2) Roads (download or user-provided), clipped to study, in target CRS
+    if ROADS_PATH:
+        roads = gpd.read_file(ROADS_PATH)
+        if roads.crs is None:
+            roads = roads.set_crs(study.crs)
+        roads = roads.to_crs(study.crs)
+        roads = gpd.overlay(roads, study, how="intersection")
     else:
-        ssds.rename(columns={}, inplace=True)
-        ssds.to_file(OUTPUT_DIR / "ssds_final.gpkg", layer="ssds", driver="GPKG")
+        roads_4326 = study.to_crs(4326)
+        roads = download_roads_osm(roads_4326).to_crs(study.crs)
 
-    print("Done. Outputs in", OUTPUT_DIR.resolve())
+    if roads.empty:
+        raise RuntimeError("No roads found after download/clip. Check study area geometry/extent and OSM coverage.")
+
+    print(f"[info] Roads loaded: {len(roads)}")
+    if "highway" in roads.columns:
+        hw = roads["highway"].apply(lambda v: ",".join(v) if isinstance(v, (list, tuple, set)) else str(v))
+        print("[info] Unique highway tags (sample):", sorted(hw.str.lower().unique())[:50])
+
+    # 3) Kerb-side SSD placement (staggered, both sides)
+    ssds_candidates = points_on_kerb_sides_staggered(roads, SPACING_MAP, KERB_OFFSET_MAP)
+    if ssds_candidates.empty:
+        raise RuntimeError("No SSD candidate points generated. Adjust spacing/kerb offsets or check roads.")
+
+    # 3b) Enforce global minimum spacing between ANY two SSDs (e.g., 50 m)
+    ssds_candidates = enforce_min_distance(ssds_candidates, MIN_SSD_SPACING)
+    if ssds_candidates.empty:
+        raise RuntimeError("All SSD candidates removed by min-distance filter. Lower MIN_SSD_SPACING or review inputs.")
+
+    ssds_candidates.to_file(OUTPUT_DIR / "ssd_candidates.shp", driver="ESRI Shapefile")
+
+    # 4) Optional: exclude buildings
+    ssds_final = exclude_points_in_buildings(ssds_candidates, BUILDINGS_PATH, target_crs)
+
+    # 4b) (Optional) enforce spacing again after exclusion (extra safety)
+    ssds_final = enforce_min_distance(ssds_final, MIN_SSD_SPACING)
+
+    ssds_final.to_file(OUTPUT_DIR / "ssds_final.shp", driver="ESRI Shapefile")
+
+    # 5) Optional QA exports (buffered polygons + backbone lines)
+    if EXPORT_BACKBONE:
+        # buffered polygons for QA
+        ensure_projected(roads, "Roads")
+        road_poly_parts = []
+        roads_norm = normalize_highway(roads)
+        for klass, buf in BUFFERS_M.items():
+            sel = roads_norm[roads_norm["__hw__"].str.contains(klass, na=False)]
+            if not sel.empty:
+                road_poly_parts.append(sel.buffer(buf, cap_style=2, join_style=2))
+        if road_poly_parts:
+            merged = pd.concat(road_poly_parts, ignore_index=True)
+            dissolved = union_all_geoms(merged.geometry.values)
+            if dissolved and not dissolved.is_empty:
+                gser = gpd.GeoSeries(dissolved, crs=roads.crs).explode(index_parts=False).buffer(0)
+                road_poly = gpd.GeoDataFrame(geometry=gser, crs=roads.crs)
+                road_poly.to_file(OUTPUT_DIR / "roads_buffered_dissolved.shp", driver="ESRI Shapefile")
+                # backbone lines from polygon rings
+                lines = []
+                for geom in road_poly.geometry:
+                    if geom is None or geom.is_empty:
+                        continue
+                    lines.append(LineString(geom.exterior.coords))
+                    for ring in getattr(geom, "interiors", []):
+                        lines.append(LineString(ring.coords))
+                if lines:
+                    gpd.GeoDataFrame(geometry=lines, crs=road_poly.crs)\
+                      .to_file(OUTPUT_DIR / "roads_backbone.shp", driver="ESRI Shapefile")
+
+    # 6) Save run config
+    (OUTPUT_DIR / "ssd_config.json").write_text(json.dumps({
+        "target_crs": target_crs,
+        "spacing_map": SPACING_MAP,
+        "kerb_offset_map": KERB_OFFSET_MAP,
+        "min_ssd_spacing": MIN_SSD_SPACING,
+        "buffers_m_QA": BUFFERS_M,
+        "study_area_path": str(STUDY_AREA_PATH),
+        "buildings_path": str(BUILDINGS_PATH) if BUILDINGS_PATH else None,
+        "roads_path": str(ROADS_PATH) if ROADS_PATH else None
+    }, indent=2), encoding="utf-8")
+
+    print("\n[done] Outputs:", OUTPUT_DIR.resolve())
+    print(" - ssd_candidates.shp  (staggered kerb-side, min-distance enforced)")
+    print(" - ssds_final.shp      (after building exclusion + min-distance)")
+    if EXPORT_BACKBONE:
+        print(" - roads_buffered_dissolved.shp (QA)")
+        print(" - roads_backbone.shp          (QA)")
 
 if __name__ == "__main__":
     sys.exit(main())
