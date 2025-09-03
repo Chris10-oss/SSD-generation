@@ -33,7 +33,6 @@ except Exception:
 
 
 # ============================= CONFIG =============================
-# Edit below. No CLI needed.
 
 CONFIG = dict(
     # INPUTS
