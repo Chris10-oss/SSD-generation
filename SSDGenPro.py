@@ -1,5 +1,5 @@
-# SSDGen Pro — Synthetic Storm Drain Generator (kerb-side, staggered, QC)
-# Author: Chris Iliadis (Newcastle University)
+# SSDGen Pro — Synthetic Storm Drain Generator Professional
+# Author: Christos Iliadis (Newcastle University)
 
 from __future__ import annotations
 
