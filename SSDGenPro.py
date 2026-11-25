@@ -1,4 +1,4 @@
-# SSDGen Pro — Synthetic Storm Drain Generator Professional
+# SSDGen — Synthetic Storm Drain Generator
 # Author: Christos Iliadis (Newcastle University)
 
 from __future__ import annotations
