@@ -1,5 +1,6 @@
 # SSDGen — Synthetic Storm Drain Generator
-# Author: Christos Iliadis (Newcastle University)
+# Author: Christos Iliadis
+# host: Newcastle University, University of Thessaly
 
 from __future__ import annotations
 
